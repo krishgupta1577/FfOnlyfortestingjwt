@@ -81,7 +81,7 @@ async def send_request(encrypted_uid, token, url):
         app.logger.error(f"Exception in send_request: {e}")
         return None
 
-async def send_multiple_requests(uid, server_name, url):
+async def send_multiple_requests(uid, server_name, url, likes_limit=None):
     try:
         region = server_name
         protobuf_message = create_protobuf_message(uid, region)
@@ -109,6 +109,11 @@ async def send_multiple_requests(uid, server_name, url):
             app.logger.error("No valid tokens found in the loaded JSON.")
             return None
 
+        # /setlikes se aaya limit apply karo (sirf utne JWT use honge)
+        if likes_limit is not None and likes_limit > 0:
+            valid_tokens = valid_tokens[:likes_limit]
+            app.logger.info(f"Using limited tokens: {len(valid_tokens)} (limit={likes_limit})")
+
         # NAYA FIX: Rate Limiting Bypass (429 Error rokne ke liye)
         semaphore = asyncio.Semaphore(300)
 
@@ -117,9 +122,9 @@ async def send_multiple_requests(uid, server_name, url):
                 await asyncio.sleep(1) # Har request ke beech chhota gap
                 return await send_request(encrypted_uid, token, url)
 
+        # Har token se 1 like request (limit ke hisaab se)
         tasks = []
-        for i in range(400):
-            token = valid_tokens[i % len(valid_tokens)]
+        for token in valid_tokens:
             tasks.append(bounded_send(token))
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -203,6 +208,16 @@ def decode_protobuf(binary):
 def handle_requests():
     uid = request.args.get("uid")
     server_name = request.args.get("server_name", "").upper()
+    # Bot ke /setlikes se aane wala limit (optional)
+    likes_param = request.args.get("likes")
+    likes_limit = None
+    if likes_param:
+        try:
+            likes_limit = int(likes_param)
+            if likes_limit < 1:
+                likes_limit = None
+        except ValueError:
+            likes_limit = None
     if not uid or not server_name:
         return jsonify({"error": "UID and server_name are required"}), 400
 
@@ -258,7 +273,7 @@ def handle_requests():
                 url = "https://clientbp.ppmainecoonghj.com/LikeProfile"
 
             # Like bhejne ka process
-            asyncio.run(send_multiple_requests(uid, server_name, url))
+            asyncio.run(send_multiple_requests(uid, server_name, url, likes_limit=likes_limit))
 
             # After-check ke liye wahi token use karein jo uper pass hua tha
             try:
