@@ -1,12 +1,5 @@
-Flask[async]
-requests
-aiohttp
-googleapis-common-protos
-pycryptodome
-protobuf
-Werkzeug
-pymongo
-dnspython
-python-dotenv
-apscheduler
-httpx
+Flask>=3.0,<4
+requests>=2.31,<3
+aiohttp>=3.9,<4
+pycryptodome>=3.20,<4
+protobuf>=5,<7
