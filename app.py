@@ -1,47 +1,92 @@
 from flask import Flask, request, jsonify
 import asyncio
+import os
+import json
+import time
+import binascii
+
+import aiohttp
+import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
-import binascii
-import aiohttp
-import requests
-import json
-import time
+from google.protobuf.message import DecodeError
+
 import like_pb2
 import like_count_pb2
 import uid_generator_pb2
-from google.protobuf.message import DecodeError
 
 app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Vercel/serverless safety: never let one upstream request hang forever.
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=5, connect=2, sock_connect=2, sock_read=4)
+PROFILE_TIMEOUT = (2, 5)
+MAX_RUNTIME_SECONDS = 50
+
+REGION_LIKE_URLS = {
+    "IND": "https://client.ind.freefiremobile.com/LikeProfile",
+    "BR": "https://client.us.freefiremobile.com/LikeProfile",
+    "US": "https://client.us.freefiremobile.com/LikeProfile",
+    "SAC": "https://client.us.freefiremobile.com/LikeProfile",
+    "NA": "https://client.us.freefiremobile.com/LikeProfile",
+}
+REGION_PROFILE_URLS = {
+    "IND": "https://client.ind.freefiremobile.com/GetPlayerPersonalShow",
+    "BR": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+    "US": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+    "SAC": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+    "NA": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
+}
+DEFAULT_LIKE_URL = "https://clientbp.ppmainecoonghj.com/LikeProfile"
+DEFAULT_PROFILE_URL = "https://clientbp.ppmainecoonghj.com/GetPlayerPersonalShow"
+
+
+def clean_token(token):
+    return str(token).strip().replace("\n", "").replace("\r", "").replace(" ", "")
+
+
+def token_file_for_region(server_name):
+    if server_name == "IND":
+        return "token_ind.json"
+    if server_name in {"BR", "US", "SAC", "NA"}:
+        return "token_br.json"
+    return "token_bd.json"
+
 
 def load_tokens(server_name):
+    path = os.path.join(BASE_DIR, token_file_for_region(server_name))
     try:
-        if server_name == "IND":
-            with open("token_ind.json", "r") as f:
-                tokens = json.load(f)
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            with open("token_br.json", "r") as f:
-                tokens = json.load(f)
-        else:
-            with open("token_bd.json", "r") as f:
-                tokens = json.load(f)
-        return tokens
-    except Exception as e:
-        app.logger.error(f"Error loading tokens for server {server_name}: {e}")
-        return None
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, list):
+            raise ValueError("token file must contain a JSON list")
+        result = []
+        for item in raw:
+            if isinstance(item, dict):
+                value = clean_token(item.get("token", ""))
+            elif isinstance(item, str):
+                value = clean_token(item)
+            else:
+                value = ""
+            if value:
+                result.append(value)
+        return result
+    except Exception as exc:
+        app.logger.error(f"Token load failed: {path}: {exc}")
+        return []
+
 
 def encrypt_message(plaintext):
     try:
-        key = b'Yg&tc%DEuh6%Zc^8'
-        iv = b'6oyZDr22E3ychjM%'
+        key = b"Yg&tc%DEuh6%Zc^8"
+        iv = b"6oyZDr22E3ychjM%"
         cipher = AES.new(key, AES.MODE_CBC, iv)
-        padded_message = pad(plaintext, AES.block_size)
-        encrypted_message = cipher.encrypt(padded_message)
-        return binascii.hexlify(encrypted_message).decode('utf-8')
-    except Exception as e:
-        app.logger.error(f"Error encrypting message: {e}")
+        return binascii.hexlify(cipher.encrypt(pad(plaintext, AES.block_size))).decode("utf-8")
+    except Exception as exc:
+        app.logger.error(f"Encryption failed: {exc}")
         return None
+
 
 def create_protobuf_message(user_id, region):
     try:
@@ -49,375 +94,354 @@ def create_protobuf_message(user_id, region):
         message.uid = int(user_id)
         message.region = region
         return message.SerializeToString()
-    except Exception as e:
-        app.logger.error(f"Error creating protobuf message: {e}")
-        return None
-
-async def send_request(encrypted_uid, token, url):
-    try:
-        edata = bytes.fromhex(encrypted_uid)
-        
-        # Long JWT Token ke cleaning ke liye 
-        clean_token = str(token).strip().replace('\n', '').replace('\r', '').replace(' ', '')
-        
-        headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {clean_token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB55"
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=edata, headers=headers) as response:
-                if response.status != 200:
-                    error_msg = await response.text()
-                    app.logger.error(f"Request failed with status code: {response.status}, Error Details: {error_msg}")
-                    return response.status
-                return await response.text()
-    except Exception as e:
-        app.logger.error(f"Exception in send_request: {e}")
-        return None
-
-async def send_multiple_requests(uid, server_name, url, likes_limit=None, before_like=0):
-    """Send like requests until the ACTUAL target is reached.
-
-    likes_limit is an actual likes target (for example /setlikes 9 means
-    try to add 9 real likes). It is NOT a JWT count. If the first 9 JWTs do
-    not produce 9 likes, additional JWTs from the saved token file are used
-    until the target is reached or all available JWTs are exhausted.
-    """
-    try:
-        region = server_name
-        protobuf_message = create_protobuf_message(uid, region)
-        if protobuf_message is None:
-            app.logger.error("Failed to create protobuf message.")
-            return None
-
-        encrypted_uid = encrypt_message(protobuf_message)
-        if encrypted_uid is None:
-            app.logger.error("Encryption failed.")
-            return None
-
-        tokens = load_tokens(server_name)
-        if tokens is None or len(tokens) == 0:
-            app.logger.error("Failed to load tokens or token list is empty.")
-            return None
-
-        valid_tokens = []
-        for t in tokens:
-            t_val = t.get("token", "").strip().replace('\n', '').replace('\r', '').replace(' ', '')
-            if t_val:
-                valid_tokens.append(t_val)
-
-        if not valid_tokens:
-            app.logger.error("No valid tokens found in the loaded JSON.")
-            return None
-
-        target = int(likes_limit) if likes_limit is not None else None
-        current_likes = int(before_like or 0)
-        target_likes = current_likes + target if target and target > 0 else None
-        jwt_used = 0
-        successful_requests = 0
-        # Vercel-safe deadline: return a JSON result instead of hanging until the platform kills the function.
-        deadline = time.monotonic() + 45
-
-        app.logger.info(
-            f"Like target: {target if target else 'ALL'} | "
-            f"Starting likes: {current_likes} | Available JWTs: {len(valid_tokens)}"
-        )
-
-        # One JWT at a time. After every request, check the real like count.
-        # This allows the API to consume extra JWTs when some JWTs give 0 likes.
-        for index, token in enumerate(valid_tokens, start=1):
-            if time.monotonic() >= deadline:
-                app.logger.warning("Execution safety deadline reached; returning current progress.")
-                break
-            if target_likes is not None and current_likes >= target_likes:
-                app.logger.info(
-                    f"Target reached: {current_likes}/{target_likes}. "
-                    f"Stopping after {jwt_used} JWT(s)."
-                )
-                break
-
-            jwt_used += 1
-            try:
-                await asyncio.sleep(0.15)
-                result = await send_request(encrypted_uid, token, url)
-                successful_requests += 1
-
-                if isinstance(result, int):
-                    app.logger.warning(
-                        f"JWT {index}/{len(valid_tokens)} failed with HTTP {result}. "
-                        f"Trying next JWT."
-                    )
-                    continue
-
-                # Check actual likes immediately after this JWT.
-                try:
-                    after = make_request(encrypted_uid, server_name, token)
-                    if after is not None:
-                        jsone = MessageToJson(after)
-                        data_after = json.loads(jsone)
-                        new_likes = int(data_after.get('AccountInfo', {}).get('Likes', 0))
-                        app.logger.info(
-                            f"JWT {index}: likes {current_likes} -> {new_likes}"
-                        )
-                        current_likes = new_likes
-                    else:
-                        app.logger.warning(
-                            f"JWT {index}: like request sent, but profile check returned no data."
-                        )
-                except Exception as check_error:
-                    app.logger.warning(
-                        f"JWT {index}: profile check failed: {check_error}. "
-                        f"Trying next JWT."
-                    )
-
-            except Exception as request_error:
-                app.logger.warning(
-                    f"JWT {index}/{len(valid_tokens)} request error: {request_error}. "
-                    f"Trying next JWT."
-                )
-
-        target_reached = bool(target_likes is not None and current_likes >= target_likes)
-        if target_likes is not None:
-            app.logger.info(
-                f"Final target result: {current_likes - int(before_like or 0)} "
-                f"likes gained | Target: {target} | JWTs used: {jwt_used}/{len(valid_tokens)} | "
-                f"Reached: {target_reached}"
-            )
-
-        return {
-            "likes_before": int(before_like or 0),
-            "likes_after": current_likes,
-            "likes_given": max(0, current_likes - int(before_like or 0)),
-            "target": target,
-            "target_reached": target_reached if target is not None else None,
-            "jwt_used": jwt_used,
-            "available_jwts": len(valid_tokens),
-            "successful_requests": successful_requests,
-        }
-
-    except Exception as e:
-        app.logger.error(f"Exception in send_multiple_requests: {e}")
+    except Exception as exc:
+        app.logger.error(f"Like protobuf creation failed: {exc}")
         return None
 
 
-def create_protobuf(uid):
+def create_profile_protobuf(uid):
     try:
         message = uid_generator_pb2.uid_generator()
         message.uid = int(uid)
         message.value = 1
         return message.SerializeToString()
-    except Exception as e:
-        app.logger.error(f"Error creating uid protobuf: {e}")
+    except Exception as exc:
+        app.logger.error(f"Profile protobuf creation failed: {exc}")
         return None
 
-def enc(uid):
-    protobuf_data = create_protobuf(uid)
-    if protobuf_data is None:
-        return None
-    encrypted_uid = encrypt_message(protobuf_data)
-    return encrypted_uid
 
-def make_request(encrypt, server_name, token):
+def enc_profile(uid):
+    data = create_profile_protobuf(uid)
+    return encrypt_message(data) if data is not None else None
+
+
+def decode_profile(binary):
     try:
-        if server_name == "IND":
-            url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-        else:
-            url = "https://clientbp.ppmainecoonghj.com/GetPlayerPersonalShow"
-            
-        edata = bytes.fromhex(encrypt)
-        
-        # Token clean karna zaroori hai headers parse hone ke liye
-        clean_token = str(token).strip().replace('\n', '').replace('\r', '').replace(' ', '')
-        
-        headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {clean_token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB55"
-        }
-        
-        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=(4, 8))
-        
+        info = like_count_pb2.Info()
+        info.ParseFromString(binary)
+        return info
+    except DecodeError as exc:
+        app.logger.warning(f"Profile protobuf decode failed: {exc}")
+        return None
+    except Exception as exc:
+        app.logger.warning(f"Unexpected profile decode error: {exc}")
+        return None
+
+
+def profile_to_dict(profile):
+    data = json.loads(MessageToJson(profile))
+    account = data.get("AccountInfo", {})
+    return {
+        "likes": int(account.get("Likes", 0) or 0),
+        "uid": int(account.get("UID", 0) or 0),
+        "nickname": str(account.get("PlayerNickname", "") or ""),
+        "region": str(account.get("region", "") or ""),
+        "level": str(account.get("level", "") or ""),
+    }
+
+
+def sync_profile_request(encrypted_uid, server_name, token):
+    """Bounded synchronous profile lookup used only for initial/final checks."""
+    url = REGION_PROFILE_URLS.get(server_name, DEFAULT_PROFILE_URL)
+    headers = {
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+        "Connection": "Keep-Alive",
+        "Accept-Encoding": "gzip",
+        "Authorization": f"Bearer {clean_token(token)}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Unity-Version": "2018.4.11f1",
+        "X-GA": "v1 1",
+        "ReleaseVersion": "OB55",
+    }
+    try:
+        response = requests.post(
+            url,
+            data=bytes.fromhex(encrypted_uid),
+            headers=headers,
+            timeout=PROFILE_TIMEOUT,
+            verify=False,
+        )
         if response.status_code != 200:
-            raise Exception(f"API Error! Status: {response.status_code}, Server Message: {response.text}")
-            
-        hex_data = response.content.hex()
-        binary = bytes.fromhex(hex_data)
-        decode = decode_protobuf(binary)
-        
-        if decode is None:
-            raise Exception("Server ne data diya par Protobuf decode fail ho gaya.")
-            
-        return decode
-    except Exception as e:
-        raise Exception(f"make_request failed: {str(e)}")
-
-def decode_protobuf(binary):
-    try:
-        items = like_count_pb2.Info()
-        items.ParseFromString(binary)
-        return items
-    except DecodeError as e:
-        app.logger.error(f"Error decoding Protobuf data: {e}")
-        return None
-    except Exception as e:
-        app.logger.error(f"Unexpected error during protobuf decoding: {e}")
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+        return decode_profile(response.content)
+    except Exception as exc:
+        app.logger.warning(f"Profile request failed: {exc}")
         return None
 
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({"status": "ok", "service": "Free Fire Like API", "usage": "/like?uid=<UID>&server_name=<REGION>&likes=<TARGET>"}), 200
 
-@app.route('/health', methods=['GET'])
+async def send_like_batch(session, encrypted_uid, tokens, url, deadline):
+    """Send a bounded batch concurrently. One JWT produces at most one request."""
+    if not tokens or time.monotonic() >= deadline:
+        return 0, len(tokens), []
+
+    async def one(token):
+        headers = {
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+            "Authorization": f"Bearer {clean_token(token)}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Expect": "100-continue",
+            "X-Unity-Version": "2018.4.11f1",
+            "X-GA": "v1 1",
+            "ReleaseVersion": "OB55",
+        }
+        try:
+            remaining = max(0.2, deadline - time.monotonic())
+            timeout = aiohttp.ClientTimeout(
+                total=min(4.5, remaining), connect=min(1.5, remaining), sock_connect=min(1.5, remaining), sock_read=min(3.5, remaining)
+            )
+            async with session.post(url, data=bytes.fromhex(encrypted_uid), headers=headers, timeout=timeout) as response:
+                body = await response.text()
+                return response.status == 200, response.status, body[:200]
+        except Exception as exc:
+            return False, None, str(exc)[:200]
+
+    results = await asyncio.gather(*(one(t) for t in tokens), return_exceptions=False)
+    success = sum(1 for ok, _, _ in results if ok)
+    failed = len(results) - success
+    return success, failed, results
+
+
+async def send_multiple_requests(uid, server_name, url, likes_limit=None, before_like=0, working_token=None):
+    """Actual-like target algorithm with bounded batches and a hard runtime limit.
+
+    `likes_limit` means ACTUAL additional likes, never JWT count.
+    A batch can never contain more JWTs than the remaining target, so it cannot
+    intentionally overshoot the target under the one-request/one-like model.
+    After each batch the real profile Likes value is checked.
+    """
+    start = time.monotonic()
+    deadline = start + MAX_RUNTIME_SECONDS
+    region = server_name
+    protobuf = create_protobuf_message(uid, region)
+    if protobuf is None:
+        return {"error": "Failed to create like protobuf."}
+    encrypted_uid = encrypt_message(protobuf)
+    if encrypted_uid is None:
+        return {"error": "Encryption failed."}
+
+    tokens = load_tokens(server_name)
+    if not tokens:
+        return {"error": "Token file is empty or unavailable."}
+
+    target = int(likes_limit) if likes_limit is not None and int(likes_limit) > 0 else None
+    baseline = int(before_like)
+    last_like = baseline
+    attempted = 0
+    success_requests = 0
+    failed = 0
+    checks = 0
+    token_index = 0
+    profile_token = working_token or tokens[0]
+    like_url = url or REGION_LIKE_URLS.get(server_name, DEFAULT_LIKE_URL)
+
+    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector, timeout=HTTP_TIMEOUT) as session:
+        while token_index < len(tokens) and time.monotonic() < deadline:
+            actual_given = max(0, last_like - baseline)
+            if target is not None and actual_given >= target:
+                break
+
+            if target is None:
+                # Full mode is intentionally bounded so a serverless function cannot hang.
+                batch_size = min(10, len(tokens) - token_index)
+            else:
+                remaining_target = max(1, target - actual_given)
+                batch_size = min(remaining_target, 20, len(tokens) - token_index)
+
+            batch = tokens[token_index:token_index + batch_size]
+            token_index += batch_size
+            attempted += len(batch)
+
+            ok_count, fail_count, results = await send_like_batch(
+                session, encrypted_uid, batch, like_url, deadline
+            )
+            success_requests += ok_count
+            failed += fail_count
+
+            for i, result in enumerate(results, start=1):
+                if not result[0]:
+                    app.logger.warning(f"JWT #{attempted - len(batch) + i} failed: {result[2]}")
+
+            # One profile check per batch, not one profile request per JWT.
+            if time.monotonic() >= deadline:
+                break
+
+            profile = await asyncio.to_thread(sync_profile_request, encrypted_uid, server_name, profile_token)
+            checks += 1
+            if profile is not None:
+                try:
+                    last_like = profile_to_dict(profile)["likes"]
+                    actual_given = max(0, last_like - baseline)
+                    app.logger.info(
+                        f"Batch complete: JWTs={len(batch)}, actual_likes={actual_given}, target={target}"
+                    )
+                    if target is not None and actual_given >= target:
+                        break
+                except Exception as exc:
+                    app.logger.warning(f"Profile parse failed after batch: {exc}")
+            else:
+                # If profile lookup fails, continue with the next batch only while time remains.
+                app.logger.warning("Profile check failed after like batch; continuing with bounded retry.")
+
+    actual_given = max(0, last_like - baseline)
+    return {
+        "attempted": attempted,
+        "success_requests": success_requests,
+        "failed": failed,
+        "actual_likes": actual_given,
+        "target": target,
+        "target_reached": target is None or actual_given >= target,
+        "profile_checks": checks,
+        "elapsed_seconds": round(time.monotonic() - start, 2),
+        "token_pool": len(tokens),
+    }
+
+
+@app.get("/")
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({
+        "status": "ok",
+        "service": "Free Fire Like API",
+        "usage": "/like?uid=<UID>&server_name=<REGION>&likes=<TARGET>",
+    })
 
-@app.route('/like', methods=['GET'])
+
+@app.get("/health")
+def health2():
+    return jsonify({"status": "ok"})
+
+
+@app.get("/like")
 def handle_requests():
-    uid = request.args.get("uid")
-    server_name = request.args.get("server_name", "").upper()
-    if not uid or not uid.isdigit() or len(uid) > 20:
-        return jsonify({"error": "Valid numeric UID is required"}), 400
-    allowed_regions = {"IND", "BR", "US", "SAC", "NA", "BD"}
-    if server_name not in allowed_regions:
-        return jsonify({"error": f"Unsupported server_name: {server_name}"}), 400
-    # Bot ke /setlikes se aane wala limit (optional)
-    likes_param = request.args.get("likes")
+    uid = str(request.args.get("uid", "")).strip()
+    server_name = str(request.args.get("server_name", "")).strip().upper()
+
+    if not uid or not uid.isdigit():
+        return jsonify({"error": "UID must be numeric"}), 400
+    if not server_name:
+        return jsonify({"error": "server_name is required"}), 400
+
+    likes_param = request.args.get("likes") or request.args.get("target")
+    full_mode = str(request.args.get("full", "0")).lower() in {"1", "true", "yes", "full"}
     likes_limit = None
-    if likes_param:
+    if not full_mode and likes_param not in (None, ""):
         try:
             likes_limit = int(likes_param)
             if likes_limit < 1:
-                likes_limit = None
+                return jsonify({"error": "likes/target must be >= 1"}), 400
         except ValueError:
-            likes_limit = None
-    if not uid or not server_name:
-        return jsonify({"error": "UID and server_name are required"}), 400
+            return jsonify({"error": "likes/target must be an integer"}), 400
+
+    tokens = load_tokens(server_name)
+    if not tokens:
+        return jsonify({"error": f"No valid tokens found for region {server_name}"}), 500
+
+    encrypted_profile_uid = enc_profile(uid)
+    if encrypted_profile_uid is None:
+        return jsonify({"error": "Encryption of UID failed"}), 500
+
+    # Initial profile: try a few tokens only. Never spend the entire request timeout here.
+    before = None
+    working_token = None
+    for token in tokens[:3]:
+        before = sync_profile_request(encrypted_profile_uid, server_name, token)
+        if before is not None:
+            working_token = token
+            break
+
+    if before is None:
+        return jsonify({
+            "error": "Unable to read player profile with the first available JWTs",
+            "hint": "Check token files and region token validity.",
+        }), 502
 
     try:
-        def process_request():
-            tokens = load_tokens(server_name)
-            if tokens is None or len(tokens) == 0:
-                raise Exception("Failed to load tokens or token JSON is empty.")
-                
-            # Sirf valid tokens uthana
-            valid_tokens = [t.get("token", "").strip().replace('\n', '').replace('\r', '').replace(' ', '') for t in tokens if t.get("token", "")]
-            if not valid_tokens:
-                raise Exception("No valid tokens found in the file.")
-                
-            encrypted_uid = enc(uid)
-            if encrypted_uid is None:
-                raise Exception("Encryption of UID failed.")
+        before_data = profile_to_dict(before)
+        before_like = before_data["likes"]
+    except Exception as exc:
+        return jsonify({"error": f"Profile decode failed: {exc}"}), 502
 
-            # NAYA LOGIC: Token Fallback. Agar pehla block/fail ho to agla check karega.
-            before = None
-            working_token = None
-            
-            for tkn in valid_tokens:
-                try:
-                    before = make_request(encrypted_uid, server_name, tkn)
-                    if before is not None:
-                        working_token = tkn
-                        break
-                except Exception as e:
-                    app.logger.warning(f"Token error (Skipping to next): {str(e)}")
-                    
-            if before is None or working_token is None:
-                raise Exception("Saare tokens fail ho gaye ya block ho chuke hain. API request reject ho rahi hai.")
+    like_url = REGION_LIKE_URLS.get(server_name, DEFAULT_LIKE_URL)
 
-            try:
-                jsone = MessageToJson(before)
-            except Exception as e:
-                raise Exception(f"Error converting 'before' protobuf to JSON: {e}")
-                
-            data_before = json.loads(jsone)
-            before_like = data_before.get('AccountInfo', {}).get('Likes', 0)
-            try:
-                before_like = int(before_like)
-            except Exception:
-                before_like = 0
-            app.logger.info(f"Likes before command: {before_like}")
-
-            if server_name == "IND":
-                url = "https://client.ind.freefiremobile.com/LikeProfile"
-            elif server_name in {"BR", "US", "SAC", "NA"}:
-                url = "https://client.us.freefiremobile.com/LikeProfile"
-            else:
-                url = "https://clientbp.ppmainecoonghj.com/LikeProfile"
-
-            # Like bhejne ka process
-            send_result = asyncio.run(
-                send_multiple_requests(
-                    uid, server_name, url,
-                    likes_limit=likes_limit,
-                    before_like=before_like
-                )
+    try:
+        result = asyncio.run(
+            send_multiple_requests(
+                uid=uid,
+                server_name=server_name,
+                url=like_url,
+                likes_limit=likes_limit,
+                before_like=before_like,
+                working_token=working_token,
             )
+        )
+    except Exception as exc:
+        app.logger.exception("Like processing crashed")
+        return jsonify({"error": f"Like processing failed: {exc}"}), 500
 
-            # Final profile check. If it fails, use the last verified count
-            # returned by send_multiple_requests instead of turning a successful
-            # like run into HTTP 500.
-            after = None
-            try:
-                after = make_request(encrypted_uid, server_name, working_token)
-            except Exception as e:
-                app.logger.warning(f"Final after-profile check failed: {e}")
+    if not isinstance(result, dict):
+        return jsonify({"error": "Like processing returned no result"}), 502
+    if result.get("error"):
+        return jsonify(result), 500
 
-            player_uid = int(uid)
-            player_name = ""
-            player_region = server_name
-            player_level = ""
+    # Final profile check is best-effort and bounded. If it fails, use the last verified
+    # value from the batch loop instead of turning a successful request into a 500.
+    after = None
+    for token in [working_token] + [t for t in tokens[:5] if t != working_token]:
+        if not token:
+            continue
+        after = sync_profile_request(encrypted_profile_uid, server_name, token)
+        if after is not None:
+            break
 
-            if after is not None:
-                try:
-                    jsone_after = MessageToJson(after)
-                    data_after = json.loads(jsone_after)
-                    after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
-                    player_uid = int(data_after.get('AccountInfo', {}).get('UID', uid))
-                    player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
-                    player_region = str(data_after.get('AccountInfo', {}).get('region', server_name))
-                    player_level = str(data_after.get('AccountInfo', {}).get('level', ''))
-                except Exception as e:
-                    app.logger.warning(f"Final after-profile parse failed: {e}")
-                    after = None
+    player_uid = int(uid)
+    player_name = before_data.get("nickname", "")
+    player_region = before_data.get("region", "") or server_name
+    player_level = before_data.get("level", "")
+    after_like = before_like + int(result.get("actual_likes", 0))
 
-            if after is None:
-                if send_result is None:
-                    raise Exception("Like process failed and final profile check was unavailable.")
-                after_like = int(send_result.get("likes_after", before_like))
+    if after is not None:
+        try:
+            after_data = profile_to_dict(after)
+            after_like = after_data["likes"]
+            player_uid = after_data["uid"] or player_uid
+            player_name = after_data["nickname"] or player_name
+            player_region = after_data["region"] or player_region
+            player_level = after_data["level"] or player_level
+        except Exception as exc:
+            app.logger.warning(f"Final profile parse failed: {exc}")
 
-            like_given = max(0, after_like - before_like)
-            status = 1 if like_given != 0 else 2
-            result = {
-                "LikesGivenByAPI": like_given,
-                "LikesbeforeCommand": before_like,
-                "LikesafterCommand": after_like,
-                "PlayerNickname": player_name,
-                "PlayerRegion": player_region,
-                "PlayerLevel": player_level,
-                "UID": player_uid,
-                "status": status
-            }
-            return result
+    like_given = max(0, after_like - before_like)
+    # When the final profile is unavailable, preserve the verified batch result.
+    if after is None:
+        like_given = max(0, int(result.get("actual_likes", 0)))
+        after_like = before_like + like_given
 
-        result = process_request()
-        return jsonify(result)
-    except Exception as e:
-        app.logger.error(f"Error processing request: {e}")
-        return jsonify({"error": str(e)}), 500
+    target_reached = (
+        full_mode or likes_limit is None and result.get("target") is None
+        or (likes_limit is not None and like_given >= likes_limit)
+    )
 
-if __name__ == '__main__':
-    app.run(debug=False, use_reloader=False)
+    return jsonify({
+        "LikesGivenByAPI": like_given,
+        "LikesbeforeCommand": before_like,
+        "LikesafterCommand": after_like,
+        "TargetLikes": None if full_mode else likes_limit,
+        "TargetReached": bool(target_reached),
+        "AttemptedJWTs": int(result.get("attempted", 0)),
+        "SuccessfulJWTRequests": int(result.get("success_requests", 0)),
+        "FailedJWTs": int(result.get("failed", 0)),
+        "ProfileChecks": int(result.get("profile_checks", 0)),
+        "ElapsedSeconds": result.get("elapsed_seconds", 0),
+        "TokenPool": int(result.get("token_pool", len(tokens))),
+        "PlayerNickname": player_name,
+        "PlayerRegion": player_region,
+        "PlayerLevel": player_level,
+        "UID": player_uid,
+        "status": 1 if like_given > 0 else 2,
+    })
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), debug=False, use_reloader=False)
