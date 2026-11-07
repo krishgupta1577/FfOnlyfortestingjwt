@@ -81,55 +81,103 @@ async def send_request(encrypted_uid, token, url):
         app.logger.error(f"Exception in send_request: {e}")
         return None
 
-async def send_multiple_requests(uid, server_name, url, likes_limit=None):
+async def send_multiple_requests(uid, server_name, url, likes_limit=None, before_like=0):
     try:
         region = server_name
         protobuf_message = create_protobuf_message(uid, region)
         if protobuf_message is None:
             app.logger.error("Failed to create protobuf message.")
             return None
-            
+
         encrypted_uid = encrypt_message(protobuf_message)
         if encrypted_uid is None:
             app.logger.error("Encryption failed.")
             return None
-            
+
         tokens = load_tokens(server_name)
         if tokens is None or len(tokens) == 0:
             app.logger.error("Failed to load tokens or token list is empty.")
             return None
-            
+
         valid_tokens = []
         for t in tokens:
             t_val = t.get("token", "").strip().replace('\n', '').replace('\r', '').replace(' ', '')
             if t_val:
                 valid_tokens.append(t_val)
-                
+
         if not valid_tokens:
             app.logger.error("No valid tokens found in the loaded JSON.")
             return None
 
-        # /setlikes se aaya limit apply karo (sirf utne JWT use honge)
-        if likes_limit is not None and likes_limit > 0:
-            valid_tokens = valid_tokens[:likes_limit]
-            app.logger.info(f"Using limited tokens: {len(valid_tokens)} (limit={likes_limit})")
+        # IMPORTANT: likes_limit = ACTUAL LIKE TARGET, JWT LIMIT nahi.
+        # /setlikes 9 par sirf 9 JWT tak list ko cut nahi karna.
+        target = int(likes_limit) if likes_limit is not None and likes_limit > 0 else None
 
-        # NAYA FIX: Rate Limiting Bypass (429 Error rokne ke liye)
-        semaphore = asyncio.Semaphore(300)
+        attempted = 0
+        successful_requests = 0
+        failed_requests = 0
+        last_like = int(before_like)
 
-        async def bounded_send(token):
-            async with semaphore:
-                await asyncio.sleep(1) # Har request ke beech chhota gap
-                return await send_request(encrypted_uid, token, url)
-
-        # Har token se 1 like request (limit ke hisaab se)
-        tasks = []
+        # Sequentially JWT use karo aur har JWT ke baad actual Likes verify karo.
         for token in valid_tokens:
-            tasks.append(bounded_send(token))
-            
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return results
-        
+            if target is not None and (last_like - int(before_like)) >= target:
+                break
+
+            attempted += 1
+
+            try:
+                await asyncio.sleep(1)
+                response = await send_request(encrypted_uid, token, url)
+
+                if isinstance(response, str) or response == 200:
+                    successful_requests += 1
+                else:
+                    failed_requests += 1
+                    continue
+
+                # HTTP 200 ko actual like nahi maanenge.
+                # Player profile se current Likes verify karenge.
+                try:
+                    profile = await asyncio.to_thread(
+                        make_request, encrypted_uid, server_name, token
+                    )
+                    if profile is not None:
+                        profile_json = MessageToJson(profile)
+                        profile_data = json.loads(profile_json)
+                        current_like = int(
+                            profile_data.get('AccountInfo', {}).get('Likes', last_like)
+                        )
+                        last_like = current_like
+                        actual_given = last_like - int(before_like)
+
+                        app.logger.info(
+                            f"JWT {attempted}: actual likes={actual_given}, target={target}"
+                        )
+
+                        if target is not None and actual_given >= target:
+                            break
+
+                except Exception as check_error:
+                    app.logger.warning(
+                        f"Could not verify likes after JWT #{attempted}: {check_error}"
+                    )
+
+            except Exception as e:
+                failed_requests += 1
+                app.logger.warning(f"JWT #{attempted} failed: {e}")
+                continue
+
+        return {
+            "attempted": attempted,
+            "successful_requests": successful_requests,
+            "failed_requests": failed_requests,
+            "actual_likes": max(0, last_like - int(before_like)),
+            "target": target,
+            "target_reached": (
+                target is not None and (last_like - int(before_like)) >= target
+            ) if target is not None else False
+        }
+
     except Exception as e:
         app.logger.error(f"Exception in send_multiple_requests: {e}")
         return None
@@ -272,8 +320,17 @@ def handle_requests():
             else:
                 url = "https://clientbp.ppmainecoonghj.com/LikeProfile"
 
-            # Like bhejne ka process
-            asyncio.run(send_multiple_requests(uid, server_name, url, likes_limit=likes_limit))
+            # Like bhejne ka process.
+            # /setlikes value actual LIKE TARGET hai, JWT count nahi.
+            send_result = asyncio.run(
+                send_multiple_requests(
+                    uid,
+                    server_name,
+                    url,
+                    likes_limit=likes_limit,
+                    before_like=before_like
+                )
+            )
 
             # After-check ke liye wahi token use karein jo uper pass hua tha
             try:
@@ -302,6 +359,22 @@ def handle_requests():
                 "LikesGivenByAPI": like_given,
                 "LikesbeforeCommand": before_like,
                 "LikesafterCommand": after_like,
+                "TargetLikes": likes_limit,
+                "TargetReached": (
+                    likes_limit is not None and like_given >= likes_limit
+                ),
+                "AttemptedJWTs": (
+                    int(send_result.get("attempted", 0))
+                    if isinstance(send_result, dict) else 0
+                ),
+                "SuccessfulJWTRequests": (
+                    int(send_result.get("successful_requests", 0))
+                    if isinstance(send_result, dict) else 0
+                ),
+                "FailedJWTs": (
+                    int(send_result.get("failed_requests", 0))
+                    if isinstance(send_result, dict) else 0
+                ),
                 "PlayerNickname": player_name,
                 "PlayerRegion": player_region,
                 "PlayerLevel": player_level,
