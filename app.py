@@ -7,6 +7,7 @@ import binascii
 import aiohttp
 import requests
 import json
+import os
 from pathlib import Path
 import like_pb2
 import like_count_pb2
@@ -15,39 +16,44 @@ from google.protobuf.message import DecodeError
 
 app = Flask(__name__)
 
-# Always resolve token files relative to this app.py file.
-# This is important on Vercel/serverless deployments where the working
-# directory is not guaranteed to be the same as the source directory.
-BASE_DIR = Path(__file__).resolve().parent
+# Token files are read from the local tokens/ folder first.
+TOKEN_DIR = Path(os.getenv("TOKEN_DIR", "tokens"))
 
-@app.get("/")
-def health_check():
-    return jsonify({
-        "status": "ok",
-        "service": "Free Fire Like API",
-        "endpoint": "/like?uid=<UID>&server_name=<REGION>"
-    }), 200
+# ✅ Valid API keys
+VALID_API_KEYS = {
+    "ZEXXY"  # don't change warna api or bot dono nhi chalega 
+}
 
-@app.get("/health")
-def health():
-    return jsonify({"status": "ok"}), 200
-
+def _token_candidates(server_name):
+    region = str(server_name).upper()
+    candidates = [TOKEN_DIR / f"token_{region.lower()}.json", Path(f"token_{region.lower()}.json")]
+    if region == "IND":
+        candidates += [TOKEN_DIR / "token_ind.json", Path("token_ind.json")]
+    elif region in {"BR", "US", "SAC", "NA"}:
+        candidates += [TOKEN_DIR / "token_br.json", Path("token_br.json")]
+    else:
+        candidates += [TOKEN_DIR / "token_bd.json", Path("token_bd.json")]
+    # Preserve order and remove duplicates.
+    seen = set()
+    result = []
+    for p in candidates:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            result.append(p)
+    return result
 
 def load_tokens(server_name):
-    try:
-        if server_name == "IND":
-            with open(BASE_DIR / "token_ind.json", "r", encoding="utf-8") as f:
-                tokens = json.load(f)
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            with open(BASE_DIR / "token_br.json", "r", encoding="utf-8") as f:
-                tokens = json.load(f)
-        else:
-            with open(BASE_DIR / "token_bd.json", "r", encoding="utf-8") as f:
-                tokens = json.load(f)
-        return tokens
-    except Exception as e:
-        app.logger.error(f"Error loading tokens for server {server_name}: {e}")
-        return None
+    for path in _token_candidates(server_name):
+        try:
+            if path.exists():
+                with path.open("r", encoding="utf-8") as f:
+                    tokens = json.load(f)
+                return tokens
+        except Exception as e:
+            app.logger.warning(f"Error loading token file {path}: {e}")
+    app.logger.error(f"No token file found for server {server_name}")
+    return None
 
 def encrypt_message(plaintext):
     try:
@@ -100,58 +106,89 @@ async def send_request(encrypted_uid, token, url):
         app.logger.error(f"Exception in send_request: {e}")
         return None
 
-async def send_multiple_requests(uid, server_name, url, likes_limit=None):
+async def send_multiple_requests(uid, server_name, url, target=None, full=False):
+    """Send LikeProfile requests using the available JWT pool.
+
+    Normal members: keep trying different JWTs until the requested number of
+    successful requests is reached, so a target of 50 may consume 100+ JWTs
+    when some JWTs fail. Never intentionally sends more than the target.
+
+    Owner/admin/full mode: use every available valid JWT once.
+    """
     try:
         region = server_name
         protobuf_message = create_protobuf_message(uid, region)
         if protobuf_message is None:
-            app.logger.error("Failed to create protobuf message.")
-            return None
-            
+            return {"error": "Failed to create protobuf message."}
         encrypted_uid = encrypt_message(protobuf_message)
         if encrypted_uid is None:
-            app.logger.error("Encryption failed.")
-            return None
-            
+            return {"error": "Encryption failed."}
+
         tokens = load_tokens(server_name)
-        if tokens is None or len(tokens) == 0:
-            app.logger.error("Failed to load tokens or token list is empty.")
-            return None
-            
+        if not tokens:
+            return {"error": "No token JSON available."}
+
         valid_tokens = []
-        for t in tokens:
-            t_val = t.get("token", "").strip().replace('\n', '').replace('\r', '').replace(' ', '')
-            if t_val:
-                valid_tokens.append(t_val)
-                
+        for item in tokens:
+            if isinstance(item, dict):
+                token = str(item.get("token", "")).strip().replace("\n", "").replace("\r", "").replace(" ", "")
+                if token:
+                    valid_tokens.append(token)
         if not valid_tokens:
-            app.logger.error("No valid tokens found in the loaded JSON.")
-            return None
+            return {"error": "No valid JWT tokens found."}
 
-        # /setlikes se aaya limit apply karo (sirf utne JWT use honge)
-        if likes_limit is not None and likes_limit > 0:
-            valid_tokens = valid_tokens[:likes_limit]
-            app.logger.info(f"Using limited tokens: {len(valid_tokens)} (limit={likes_limit})")
+        if full:
+            max_requests = len(valid_tokens)
+        else:
+            try:
+                target = max(1, int(target or 50))
+            except (TypeError, ValueError):
+                target = 50
+            max_requests = None
 
-        # NAYA FIX: Rate Limiting Bypass (429 Error rokne ke liye)
-        semaphore = asyncio.Semaphore(300)
-
-        async def bounded_send(token):
-            async with semaphore:
-                await asyncio.sleep(1) # Har request ke beech chhota gap
-                return await send_request(encrypted_uid, token, url)
-
-        # Har token se 1 like request (limit ke hisaab se)
-        tasks = []
+        success_count = 0
+        attempted = 0
+        failed = 0
+        # Sequential requests intentionally allow failed JWTs to be skipped
+        # and the next JWT to be tried. A token is never reused in one run.
         for token in valid_tokens:
-            tasks.append(bounded_send(token))
-            
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return results
-        
+            if not full and success_count >= target:
+                break
+            attempted += 1
+            try:
+                result = await send_request(encrypted_uid, token, url)
+                if isinstance(result, str):
+                    success_count += 1
+                elif result == 200:
+                    success_count += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                app.logger.warning(f"JWT failed, trying next token: {e}")
+
+        if full:
+            return {
+                "success_requests": success_count,
+                "attempted": attempted,
+                "failed": failed,
+                "target": None,
+                "mode": "full",
+            }
+
+        reached = success_count >= target
+        return {
+            "success_requests": success_count,
+            "attempted": attempted,
+            "failed": failed,
+            "target": target,
+            "reached_target": reached,
+            "mode": "target",
+            "error": None if reached else f"Target {target} not reached; only {success_count} successful JWT requests."
+        }
     except Exception as e:
         app.logger.error(f"Exception in send_multiple_requests: {e}")
-        return None
+        return {"error": str(e)}
 
 def create_protobuf(uid):
     try:
@@ -195,7 +232,7 @@ def make_request(encrypt, server_name, token):
             'ReleaseVersion': "OB55"
         }
         
-        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=(10, 30))
+        response = requests.post(url, data=edata, headers=headers, verify=False)
         
         if response.status_code != 200:
             raise Exception(f"API Error! Status: {response.status_code}, Server Message: {response.text}")
@@ -227,24 +264,8 @@ def decode_protobuf(binary):
 def handle_requests():
     uid = request.args.get("uid")
     server_name = request.args.get("server_name", "").upper()
-    # Bot ke /setlikes se aane wala limit (optional)
-    likes_param = request.args.get("likes")
-    likes_limit = None
-    if likes_param:
-        try:
-            likes_limit = int(likes_param)
-            if likes_limit < 1:
-                likes_limit = None
-        except ValueError:
-            likes_limit = None
     if not uid or not server_name:
         return jsonify({"error": "UID and server_name are required"}), 400
-
-    if server_name not in {"IND", "BR", "US", "SAC", "NA", "BD"}:
-        return jsonify({"error": f"Unsupported server_name: {server_name}"}), 400
-
-    if not str(uid).isdigit():
-        return jsonify({"error": "UID must contain digits only"}), 400
 
     try:
         def process_request():
@@ -297,8 +318,22 @@ def handle_requests():
             else:
                 url = "https://clientbp.ppmainecoonghj.com/LikeProfile"
 
-            # Like bhejne ka process
-            asyncio.run(send_multiple_requests(uid, server_name, url, likes_limit=likes_limit))
+            target_raw = request.args.get("target")
+            full_mode = str(request.args.get("full", "0")).lower() in {"1", "true", "yes", "full"}
+            target = None
+            if not full_mode:
+                try:
+                    target = max(1, int(target_raw or 50))
+                except (TypeError, ValueError):
+                    target = 50
+
+            # Normal member mode: keep trying JWTs until target successful
+            # requests are reached. Full mode: use the complete JWT pool.
+            send_result = asyncio.run(
+                send_multiple_requests(uid, server_name, url, target=target, full=full_mode)
+            )
+            if not send_result or send_result.get("error") and send_result.get("success_requests", 0) == 0:
+                raise Exception(send_result.get("error", "Like requests failed.") if send_result else "Like requests failed.")
 
             # After-check ke liye wahi token use karein jo uper pass hua tha
             try:
@@ -322,9 +357,15 @@ def handle_requests():
             player_level = str(data_after.get('AccountInfo', {}).get('level', ''))
             
             like_given = after_like - before_like
-            status = 1 if like_given != 0 else 2
+            target_reached = True if full_mode else bool(send_result.get("reached_target"))
+            status = 1 if target_reached and like_given != 0 else 2
             result = {
                 "LikesGivenByAPI": like_given,
+                "TargetLikes": target,
+                "SuccessfulJWTRequests": int(send_result.get("success_requests", 0)),
+                "AttemptedJWTs": int(send_result.get("attempted", 0)),
+                "FailedJWTs": int(send_result.get("failed", 0)),
+                "TargetReached": target_reached,
                 "LikesbeforeCommand": before_like,
                 "LikesafterCommand": after_like,
                 "PlayerNickname": player_name,
@@ -342,4 +383,5 @@ def handle_requests():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+    app.run(debug=True, use_reloader=False)
+        
