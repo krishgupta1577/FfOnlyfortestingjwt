@@ -7,6 +7,7 @@ import binascii
 import aiohttp
 import requests
 import json
+import time
 import like_pb2
 import like_count_pb2
 import uid_generator_pb2
@@ -121,6 +122,8 @@ async def send_multiple_requests(uid, server_name, url, likes_limit=None, before
         target_likes = current_likes + target if target and target > 0 else None
         jwt_used = 0
         successful_requests = 0
+        # Vercel-safe deadline: return a JSON result instead of hanging until the platform kills the function.
+        deadline = time.monotonic() + 45
 
         app.logger.info(
             f"Like target: {target if target else 'ALL'} | "
@@ -130,6 +133,9 @@ async def send_multiple_requests(uid, server_name, url, likes_limit=None, before
         # One JWT at a time. After every request, check the real like count.
         # This allows the API to consume extra JWTs when some JWTs give 0 likes.
         for index, token in enumerate(valid_tokens, start=1):
+            if time.monotonic() >= deadline:
+                app.logger.warning("Execution safety deadline reached; returning current progress.")
+                break
             if target_likes is not None and current_likes >= target_likes:
                 app.logger.info(
                     f"Target reached: {current_likes}/{target_likes}. "
@@ -139,7 +145,7 @@ async def send_multiple_requests(uid, server_name, url, likes_limit=None, before
 
             jwt_used += 1
             try:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.15)
                 result = await send_request(encrypted_uid, token, url)
                 successful_requests += 1
 
@@ -243,7 +249,7 @@ def make_request(encrypt, server_name, token):
             'ReleaseVersion': "OB55"
         }
         
-        response = requests.post(url, data=edata, headers=headers, verify=False)
+        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=(4, 8))
         
         if response.status_code != 200:
             raise Exception(f"API Error! Status: {response.status_code}, Server Message: {response.text}")
@@ -271,10 +277,23 @@ def decode_protobuf(binary):
         app.logger.error(f"Unexpected error during protobuf decoding: {e}")
         return None
 
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({"status": "ok", "service": "Free Fire Like API", "usage": "/like?uid=<UID>&server_name=<REGION>&likes=<TARGET>"}), 200
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"}), 200
+
 @app.route('/like', methods=['GET'])
 def handle_requests():
     uid = request.args.get("uid")
     server_name = request.args.get("server_name", "").upper()
+    if not uid or not uid.isdigit() or len(uid) > 20:
+        return jsonify({"error": "Valid numeric UID is required"}), 400
+    allowed_regions = {"IND", "BR", "US", "SAC", "NA", "BD"}
+    if server_name not in allowed_regions:
+        return jsonify({"error": f"Unsupported server_name: {server_name}"}), 400
     # Bot ke /setlikes se aane wala limit (optional)
     likes_param = request.args.get("likes")
     likes_limit = None
@@ -401,5 +420,4 @@ def handle_requests():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False)
-
+    app.run(debug=False, use_reloader=False)
