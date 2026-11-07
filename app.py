@@ -340,28 +340,43 @@ def handle_requests():
                 )
             )
 
-            # After-check ke liye wahi token use karein jo uper pass hua tha
-            try:
-                after = make_request(encrypted_uid, server_name, working_token)
-            except Exception as e:
-                raise Exception(f"Likes chale gaye, par after-profile load me error: {str(e)}")
-                
+            # After-check: pehle working token try karo, phir baaki valid tokens.
+            # Agar profile read fail ho bhi jaye, successful like requests ko 500/connection
+            # error me convert nahi karna; send_result ka verified count use hoga.
+            after = None
+            for check_token in [working_token] + [t for t in valid_tokens if t != working_token]:
+                try:
+                    after = make_request(encrypted_uid, server_name, check_token)
+                    if after is not None:
+                        break
+                except Exception as e:
+                    app.logger.warning(f"After-profile token check failed, trying next token: {e}")
+
+            if after is not None:
+                try:
+                    jsone_after = MessageToJson(after)
+                    data_after = json.loads(jsone_after)
+                    after_like = int(data_after.get('AccountInfo', {}).get('Likes', before_like))
+                    player_uid = int(data_after.get('AccountInfo', {}).get('UID', 0))
+                    player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
+                    player_region = str(data_after.get('AccountInfo', {}).get('region', ''))
+                    player_level = str(data_after.get('AccountInfo', {}).get('level', ''))
+                    like_given = max(0, after_like - before_like)
+                except Exception as e:
+                    app.logger.warning(f"After-profile decode failed: {e}")
+                    after = None
+
             if after is None:
-                raise Exception("Likes chale gaye, par after-profile load nahi hui.")
-                
-            try:
-                jsone_after = MessageToJson(after)
-            except Exception as e:
-                raise Exception(f"Error converting 'after' protobuf to JSON: {e}")
-                
-            data_after = json.loads(jsone_after)
-            after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
-            player_uid = int(data_after.get('AccountInfo', {}).get('UID', 0))
-            player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
-            player_region = str(data_after.get('AccountInfo', {}).get('region', ''))
-            player_level = str(data_after.get('AccountInfo', {}).get('level', ''))
-            
-            like_given = after_like - before_like
+                # send_multiple_requests already verified the target after each successful JWT.
+                # Use that result instead of returning HTTP 500 just because the final profile
+                # lookup failed.
+                like_given = max(0, int(send_result.get("actual_likes", 0))) if isinstance(send_result, dict) else 0
+                after_like = before_like + like_given
+                player_uid = int(uid)
+                player_name = ""
+                player_region = server_name
+                player_level = ""
+
             status = 1 if like_given != 0 else 2
             result = {
                 "LikesGivenByAPI": like_given,
