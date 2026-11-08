@@ -181,7 +181,7 @@ async def send_request(encrypted_uid, token, url, host):
         return None
 
 
-async def send_multiple_requests(uid, server_name, url, like_count):
+async def send_multiple_requests(uid, server_name, url):
     try:
         region = server_name
         protobuf_message = create_protobuf_message(uid, region)
@@ -219,9 +219,7 @@ async def send_multiple_requests(uid, server_name, url, like_count):
                 return await send_request(encrypted_uid, token, url, host)
 
         tasks = []
-        # Send exactly the requested number of likes. Tokens are reused only
-        # after every available token has been assigned once.
-        for i in range(like_count):
+        for i in range(400):
             token = valid_tokens[i % len(valid_tokens)]
             tasks.append(bounded_send(token))
 
@@ -299,17 +297,6 @@ def handle_requests():
         return jsonify({"error": "UID and server_name are required"}), 400
 
     try:
-        requested_tokens = int(request.args.get("likes", "20"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "likes must be a whole number"}), 400
-
-    if requested_tokens < 2 or requested_tokens > 400:
-        return jsonify({"error": "likes must be between 2 and 400"}), 400
-
-    # Keep one token in reserve: 20 requested tokens produce 19 like calls.
-    like_count = requested_tokens - 1
-
-    try:
         def process_request():
             tokens = load_tokens(server_name)
             if tokens is None or len(tokens) == 0:
@@ -359,9 +346,8 @@ def handle_requests():
             urls = _get_urls(server_name)
             like_url = urls["like_url"]
 
-            # Send the requested number of likes (one token remains in reserve).
-            if like_count:
-                asyncio.run(send_multiple_requests(uid, server_name, like_url, like_count))
+            # Send likes
+            asyncio.run(send_multiple_requests(uid, server_name, like_url))
 
             # After check
             try:
